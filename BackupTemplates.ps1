@@ -19,7 +19,7 @@ $AuthToken = Invoke-RestMethod -Method Post -Uri "$SourceHost/auth/oauth2/token"
 $Headers = @{ "X-Auth-Token" = $AuthToken.access_token }
 
 # --- 2. On-Premise Discovery ---
-# Fetching Customer ID from the on-premise specific endpoint
+# Uses the on-premise specific endpoint to find the customer_id
 $Discovery = Invoke-RestMethod -Method Get -Uri "$SourceHost/api" -Headers $Headers
 $CustID = $Discovery.data.user.customer_id
 
@@ -27,69 +27,65 @@ $CustID = $Discovery.data.user.customer_id
 function Get-ContainerData($FolderID) {
     Write-Host "   Processing Container: $FolderID"
 
-    # A. Get the Detailed Folder Profile
-    # Required to get validated metadata (custom1-12, class, etc.)
+    # A. Get Detailed Folder Profile 
+    # Returns metadata like custom1-12, class, and subclass aliases
     $ProfileUri = "$SourceHost/work/api/v2/customers/$CustID/libraries/$Library/folders/$FolderID"
     $ProfileRes = Invoke-RestMethod -Method Get -Uri $ProfileUri -Headers $Headers
     
-    # B. Get the Folder Security
-    # Required to get default_security and specific user/group access levels
+    # B. Get Folder Security
+    # Returns default_security (inherit/private/etc.) and the user/group access list
     $SecurityUri = "$SourceHost/work/api/v2/customers/$CustID/libraries/$Library/folders/$FolderID/security"
     $SecurityRes = Invoke-RestMethod -Method Get -Uri $SecurityUri -Headers $Headers
 
-    # C. Get Subfolders
-    $SubUri = "$SourceHost/work/api/v2/customers/$CustID/libraries/$Library/folders/$FolderID/subfolders"
+    # C. Get Sub-containers (Folders/Tabs)
+    # Using the Library Folders endpoint with container_id returns all nested items
+    $SubUri = "$SourceHost/work/api/v2/customers/$CustID/libraries/$Library/folders?container_id=$FolderID"
     $SubRes = Invoke-RestMethod -Method Get -Uri $SubUri -Headers $Headers
     
-    # Handle the on-premise 'results' array wrapper
-    $Folders = if ($SubRes.data.results) { $SubRes.data.results } else { $SubRes.data }
+    # Standardizing response handling for on-premise results array
+    $Children = if ($SubRes.data.results) { $SubRes.data.results } else { $SubRes.data }
 
-    $ChildData = foreach ($f in $Folders) {
-        # Recursive call to process nested folders
-        Get-ContainerData -FolderID $f.id
+    $ChildData = foreach ($child in $Children) {
+        # Recurse through the tree
+        Get-ContainerData -FolderID $child.id
     }
 
     return [PSCustomObject]@{
         Profile  = $ProfileRes.data
-        Security = $SecurityRes # Includes default_security and the data array of users/groups
+        Security = $SecurityRes
         Children = $ChildData
     }
 }
 
 # --- 4. Main Export Loop ---
-Write-Host "Fetching list of templates from $Library..."
+Write-Host "Fetching all templates from library: $Library..."
 $TemplateUri = "$SourceHost/work/api/v2/customers/$CustID/libraries/$Library/templates"
 $TmplResponse = Invoke-RestMethod -Method Get -Uri $TemplateUri -Headers $Headers
 
-# Extract results from on-premise data envelope
-$Templates = $TmplResponse.data.results
+$Templates = if ($TmplResponse.data.results) { $TmplResponse.data.results } else { $TmplResponse.data }
 $BackupData = @()
 
 foreach ($Tmpl in $Templates) {
     Write-Host "Starting Export for Template: $($Tmpl.name)"
     
-    # Get Root Folders and Root Tabs using Template ID as workspaceId
-    $RootFolderUri = "$SourceHost/work/api/v2/customers/$CustID/libraries/$Library/workspaces/$($Tmpl.id)/folders"
-    $TabUri = "$SourceHost/work/api/v2/customers/$CustID/libraries/$Library/workspaces/$($Tmpl.id)/tabs"
+    # Consolidated call to get all root-level containers (folders and tabs)
+    $RootContainersUri = "$SourceHost/work/api/v2/customers/$CustID/libraries/$Library/folders?container_id=$($Tmpl.id)"
+    $RootContainersRes = Invoke-RestMethod -Method Get -Uri $RootContainersUri -Headers $Headers
     
-    $RootFoldersRes = Invoke-RestMethod -Method Get -Uri $RootFolderUri -Headers $Headers
-    $TabsRes = Invoke-RestMethod -Method Get -Uri $TabUri -Headers $Headers
-    
-    $RFolders = if ($RootFoldersRes.data.results) { $RootFoldersRes.data.results } else { $RootFoldersRes.data }
-    $RTabs = if ($TabsRes.data.results) { $TabsRes.data.results } else { $TabsRes.data }
+    $RootItems = if ($RootContainersRes.data.results) { $RootContainersRes.data.results } else { $RootContainersRes.data }
 
-    # Map root containers to the detailed profile/security function
-    $FullFolderTree = foreach ($rf in $RFolders) { Get-ContainerData -FolderID $rf.id }
-    $FullTabTree = foreach ($rt in $RTabs) { Get-ContainerData -FolderID $rt.id }
+    # Iterate through root items to fetch profiles, security, and sub-items
+    $FullContainerTree = foreach ($item in $RootItems) { 
+        Get-ContainerData -FolderID $item.id 
+    }
 
     $BackupData += [PSCustomObject]@{
         TemplateProfile = $Tmpl
-        Folders         = $FullFolderTree
-        Tabs            = $FullTabTree
+        Containers      = $FullContainerTree
     }
 }
 
 # --- 5. Save Final Backup ---
-# Increased Depth to 20 to ensure deep nested security/folder objects are captured
+# Depth is set to 20 to ensure deeply nested JSON objects are fully serialized
 $BackupData | ConvertTo-Json -Depth 20 | Out-File $BackupFile
-Write-Host "SUCCESS: Full Backup saved to $BackupFile"
+Write-Host "SUCCESS: Comprehensive Template Backup saved to $BackupFile"
